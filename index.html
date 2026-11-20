@@ -80,7 +80,7 @@ const CONFIG = {
   },
   ships: {                       // BÖLÜM 1 – Gemiler karadan yürüyor
     progressMax: 1000,           // "Gemiler Haliç'e" barının kapasitesi
-    passivePerSecond: 6,         // hiç etkileşim olmasa da bar dolar (1000/6 ≈ 2,8 dk)
+    passivePerSecond: 0,         // 0 = bar sadece izleyici etkileşimiyle dolar
     likeValue: 1,                // her beğeni bara kaç puan ekler
     chatValue: 3,                // her yorum bara kaç puan ekler
     giftValuePerDiamond: 15,     // hediyede elmas başına puan
@@ -91,10 +91,15 @@ const CONFIG = {
     minActive: 4,                // tepede her zaman en az bu kadar gemi olsun
     maxShips: 8,                 // tepede aynı anda en fazla gemi
     maxHarbor: 10,               // Haliç'te görünen en fazla gemi
-    baseSpeed: 0.018,            // gemilerin normal kayma hızı (yol oranı/sn)
+    baseSpeed: 0,                // 0 = gemiler sadece beğeni/yorum/hediye ile yürür
     likePush: 0.003,             // beğeni başına ek hız
     maxPush: 0.12,               // beğenilerle ulaşılabilecek en fazla ek hız
-    pushDecay: 0.8,              // ek hızın sönme hızı
+    pushDecay: 0.9,              // ek hızın sönme hızı (büyük = gemiler daha çabuk durur)
+    chatPush: 0.012,             // her yorumun gemilere verdiği ek hız
+    socialPush: 0.02,            // takip/paylaşımın gemilere verdiği ek hız
+    boostSpeed: 0.05,            // hediye hızlandırmasında eklenen sabit hız
+    slipDelaySeconds: 4,         // bu kadar saniye gemiler itilmezse kızaktan geri kaymaya başlar
+    slipPerSecond: 0.006,        // geri kayma hızı (yol oranı/sn)
     boostSeconds: 6,             // küçük hediyenin hız etkisi süresi
     boostMultiplier: 2.2,        // hız çarpanı
     gap: 0.09                    // gemiler arası en az mesafe (yol oranı)
@@ -1332,7 +1337,7 @@ const G = {
   projectiles: [], floaters: [],
   notifs: [], notifQueue: [], notifTimer: 0,
   banner: null, shake: 0, flash: 0, fade: 0,
-  lastHitTime: 0, regenActive: false, smallIdx: 0, lastActivity: 0, allTop: [], recent: new Map(), repairAt: 0,
+  lastHitTime: 0, regenActive: false, smallIdx: 0, lastActivity: 0, allTop: [], recent: new Map(), repairAt: 0, shipSpeed: 0, lastPushTime: 0, slipping: false,
   tokens: CONFIG.spam.maxEffectsPerSecond
 };
 const queue = [];
@@ -1371,7 +1376,7 @@ function clearProjectiles() {
   G.projectiles.length = 0;
 }
 function resetGame() {
-  G.phase = 'phase1'; G.phaseTime = 0; G.progress = 0; G.push = 0; G.boostUntil = 0; G.hero = null; G.lastActivity = G.now;
+  G.phase = 'phase1'; G.phaseTime = 0; G.progress = 0; G.push = 0; G.boostUntil = 0; G.hero = null; G.lastActivity = G.now; G.lastPushTime = G.now;
   for (const s of G.soldiers) soldierRoot.remove(s.obj);
   G.soldiers.length = 0; G.soldierMap.clear(); SLOTS.forEach(s => (s.used = false));
   G.scores.clear(); G.top = []; G.finalTop = [];
@@ -1520,14 +1525,14 @@ function processEvent(e) {
     case 'chat': {
       if (P === 'final') break;
       addSoldier(e);
-      if (P === 'phase1') addProgress(CONFIG.ships.chatValue, e);
+      if (P === 'phase1') { addProgress(CONFIG.ships.chatValue, e); pushShips(CONFIG.ships.chatPush); }
       else if (P === 'phase2') fireArrows(1, CONFIG.damage.chat, e);
       break;
     }
     case 'like': {
       if (P === 'phase1') {
         addProgress(e.count * CONFIG.ships.likeValue, e);
-        G.push = Math.min(CONFIG.ships.maxPush, G.push + e.count * CONFIG.ships.likePush);
+        pushShips(e.count * CONFIG.ships.likePush);
         if (takeToken()) shipSparkle(Math.min(e.count, 8));
       } else if (P === 'phase2') {
         fireArrows(Math.min(e.count, 6), e.count * CONFIG.damage.like, e);
@@ -1552,14 +1557,14 @@ function processEvent(e) {
         if (s) burst(s.slot.x, groundY(s.slot.x, s.slot.z) + 1.5, s.slot.z, 18, { speed: 5, life: 0.9, size: 0.35, color: C_GOLD, add: true, g: -2 });
       }
       addScore(e, CONFIG.bonus.follow);
-      if (P === 'phase1') G.progress = Math.min(CONFIG.ships.progressMax, G.progress + CONFIG.ships.followValue);
+      if (P === 'phase1') { G.progress = Math.min(CONFIG.ships.progressMax, G.progress + CONFIG.ships.followValue); pushShips(CONFIG.ships.socialPush); }
       notify(e.name + ' orduya katıldı!', '#9be39b', '➕');
       SFX.chime();
       break;
     }
     case 'share': {
       addScore(e, CONFIG.bonus.share);
-      if (P === 'phase1') G.progress = Math.min(CONFIG.ships.progressMax, G.progress + CONFIG.ships.shareValue);
+      if (P === 'phase1') { G.progress = Math.min(CONFIG.ships.progressMax, G.progress + CONFIG.ships.shareValue); pushShips(CONFIG.ships.socialPush); }
       notify(e.name + ' haberi yaydı!', '#a8d8ff', '📣');
       burst(rand(-10, 10), 4, 22, 24, { speed: 7, life: 1.4, size: 0.3, color: C_WHITE, add: true, g: 2, upMin: 0.6 });
       break;
@@ -1571,6 +1576,7 @@ function giftScore(tier, count) {
   const D = CONFIG.damage, reps = Math.min(count, 50);
   return [D.arrow, D.cannon, D.sahi, D.barrage * 3][tier] * reps;
 }
+function pushShips(v) { G.push = Math.min(CONFIG.ships.maxPush, G.push + v); }
 function phase1Gift(tier, e, total, xN) {
   const C = CONFIG.ships;
   G.progress = Math.min(C.progressMax, G.progress + total * C.giftValuePerDiamond);
@@ -1582,6 +1588,7 @@ function phase1Gift(tier, e, total, xN) {
     shipSparkle(10);
   } else if (tier === 1) {
     for (let i = 0; i < Math.min(e.count, 2); i++) spawnShip();
+    boost(C.boostSeconds / 2);
     notify(e.name + ' yeni bir gemiyi kızağa koydu!' + xN, '#ffd56b', '🚢');
   } else if (tier === 2) {
     spawnShip(); spawnShip(); boost(C.boostSeconds);
@@ -1988,15 +1995,26 @@ function update(dt) {
 }
 function updateShips(dt) {
   const C = CONFIG.ships;
-  const boost = G.now < G.boostUntil ? C.boostMultiplier : 1;
-  const sp = G.phase === 'trans1' ? 0.35 : (C.baseSpeed + G.push) * boost;
+  const boosting = G.now < G.boostUntil;
+  const sp = G.phase === 'trans1' ? 0.35 : (C.baseSpeed + G.push) * (boosting ? C.boostMultiplier : 1) + (boosting ? C.boostSpeed : 0);
+  G.shipSpeed = sp;
   G.push *= Math.exp(-dt * C.pushDecay);
+  if (sp > 0.004) G.lastPushTime = G.now;
   G.ships.sort((a, b) => b.u - a.u);
   for (let i = 0; i < G.ships.length; i++) {
     const s = G.ships[i];
     let nu = s.u + sp * s.k * dt;
     if (i > 0) nu = Math.min(nu, G.ships[i - 1].u - C.gap);
     if (nu > s.u) s.u = nu;
+  }
+  // itilmeyen gemiler kızaktan geri kayar (arkadakinden başlayarak, aradaki mesafe korunur)
+  G.slipping = G.phase === 'phase1' && G.now - G.lastPushTime > C.slipDelaySeconds;
+  if (G.slipping) for (let i = G.ships.length - 1; i >= 0; i--) {
+    const s = G.ships[i];
+    if (s.u <= 0) continue;
+    let nu = Math.max(0, s.u - C.slipPerSecond * dt);
+    if (i < G.ships.length - 1 && G.ships[i + 1].u > 0) nu = Math.max(nu, G.ships[i + 1].u + C.gap);
+    if (nu < s.u) s.u = nu;
   }
   for (let i = G.ships.length - 1; i >= 0; i--) {
     const s = G.ships[i];
@@ -2127,7 +2145,9 @@ function drawTopUI() {
     const r = G.progress / CONFIG.ships.progressMax;
     drawBar(40, 178, 1000, 54, r, '#7fd0f0', '#2f7fc0', "⛵ GEMİLER HALİÇ'E", Math.floor(r * 100) + '%');
     const boost = G.now < G.boostUntil;
-    txt("Haliç'teki gemiler: " + G.harbor.length + (boost ? '   ⚡ Rüzgâr arkada!' : ''), 540, 258, 24, boost ? '#ffe27a' : '#e6f2ff', 'center', { lw: 5 });
+    if (G.phase === 'phase1' && G.slipping) { if (Math.sin(G.now * 8) > -0.3) txt('⚓ Gemiler geri kayıyor! ❤️ Beğen, 💬 yorum yaz!', 540, 258, 27, '#ff7a6a', 'center', { lw: 6 }); }
+    else if (G.phase === 'phase1' && G.shipSpeed < 0.004) txt('⚓ Gemiler durdu! ❤️ Beğen, 💬 yorum yaz!', 540, 258, 26, '#ffb08a', 'center', { lw: 5 });
+    else txt("Haliç'teki gemiler: " + G.harbor.length + (boost ? '   ⚡ Rüzgâr arkada!' : ''), 540, 258, 24, boost ? '#ffe27a' : '#e6f2ff', 'center', { lw: 5 });
   } else if (P === 'phase2' || P === 'flag') {
     let hp = 0, mx = 0, broken = 0;
     for (const s of SECTIONS) { hp += s.hp; mx += s.max; if (s.collapsed) broken++; }
