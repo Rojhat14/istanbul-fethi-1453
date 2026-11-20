@@ -62,7 +62,9 @@ const CONFIG = {
     volume: 0.55,                // ana ses seviyesi 0-1
     maxSoundsPerSecond: 10,      // ses spamını önler
     music: true,                 // arka planda özgün mehter marşı (tarayıcıda notadan üretilir, telifsiz)
-    musicVolume: 0.32            // müziğin efektlere göre seviyesi 0-1
+    musicVolume: 0.32,           // notadan üretilen marşın seviyesi 0-1
+    musicFile: 'mehter.mp3',     // oyunla aynı klasördeki müzik dosyası ('' = notadan üretilen marş)
+    musicFileVolume: 0.35        // müzik dosyasının seviyesi 0-1
   },
   difficulty: {                  // surların canı izleyici sayısına göre ölçeklenir
     hpPerParticipant: 40,        // Bölüm 1'de etkileşime giren her kişi için sur bölümüne eklenecek can
@@ -305,15 +307,34 @@ const SFX = (function () {
     if (k % 32 >= 28) tone(t, 0.25, 58, 40, 0.5, 'sine', 0.005, musicGain);                 // kös gürlemesi
   }
   setInterval(() => {
-    if (!musicOn || muted || !ac || ac.state !== 'running') return;
+    if (!musicOn || muted || trackOk || !ac || ac.state !== 'running') return;
     if (!musicGain) { musicGain = ac.createGain(); musicGain.gain.value = A.musicVolume; musicGain.connect(master); }
     if (mNext < ac.currentTime) mNext = ac.currentTime + 0.05;
     while (mNext < ac.currentTime + 0.35) { musicStep(mNext, mStep); mStep = (mStep + 1) % STEPS; mNext += EIGHTH; }
   }, 60);
+  // Müzik dosyası: çalınamazsa (dosya yok/bozuk) notadan üretilen marşa dönülür
+  let track = null, trackOk = false;
+  if (A.music && A.musicFile) {
+    try {
+      track = new Audio(A.musicFile); track.loop = true; track.preload = 'auto';
+      track.volume = clamp(A.volume * A.musicFileVolume * 1.8, 0, 1);
+      trackOk = true;
+      track.addEventListener('error', () => { trackOk = false; track = null; });
+    } catch (e) { track = null; trackOk = false; }
+  }
+  function syncTrack() {
+    if (!track) return;
+    const want = musicOn && !muted;
+    if (want && track.paused) track.play().catch(() => {});
+    else if (!want && !track.paused) track.pause();
+  }
+  setInterval(syncTrack, 500);
+  ['pointerdown', 'keydown', 'touchstart'].forEach(ev => window.addEventListener(ev, syncTrack, { passive: true }));
   function setMusic(on) {
     on = !!on && A.music;
     if (on === musicOn) return;
     musicOn = on;
+    syncTrack();
     if (!ac) return;
     if (!musicGain) { musicGain = ac.createGain(); musicGain.gain.value = A.musicVolume; musicGain.connect(master); }
     if (on) { mStep = 0; mNext = 0; }
@@ -327,6 +348,7 @@ const SFX = (function () {
     },
     get muted() { return muted; },
     get state() { return !ac ? 'yok' : muted ? 'kapalı' : ac.state === 'running' ? 'açık' : 'tıklayın'; },
+    get musicSource() { return trackOk ? (track && !track.paused ? 'dosya (çalıyor)' : 'dosya') : 'üretilen marş'; },
     toggle() { muted = !muted; if (!muted) unlock(); return muted; },
     boom(big) {
       if (!ready(big)) return;
@@ -2398,6 +2420,7 @@ if (new URLSearchParams(location.search).get('test') === '1' || location.hash ==
       'Gemi: ' + G.ships.length + '   Parçacık: ' + (PS.norm.list.length + PS.add.list.length) + '\n' +
       'Çizim: ' + info.calls + '   Üçgen: ' + Math.round(info.triangles / 1000) + 'k\n' +
       'WebSocket: ' + wsStatus + '   Ses: ' + SFX.state + '\n' +
+      'Müzik: ' + SFX.musicSource + '\n' +
       'Sur canı: ' + (SECTIONS[0] ? fmt(SECTIONS[0].max) : '-') + '   Sefer: ' + STORE.sefer + '\n' +
       'Aktif izleyici: ' + activeViewers() + '   Onarım: ' + (G.phase === 'phase2' ? Math.max(0, Math.ceil(G.repairAt - G.now)) + ' sn' : '-');
   }, 500);
