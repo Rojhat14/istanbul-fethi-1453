@@ -60,7 +60,9 @@ const CONFIG = {
   audio: {
     enabled: true,               // ses efektleri (dosya gerektirmez, tarayıcıda üretilir)
     volume: 0.55,                // ana ses seviyesi 0-1
-    maxSoundsPerSecond: 10       // ses spamını önler
+    maxSoundsPerSecond: 10,      // ses spamını önler
+    music: true,                 // arka planda özgün mehter marşı (tarayıcıda notadan üretilir, telifsiz)
+    musicVolume: 0.32            // müziğin efektlere göre seviyesi 0-1
   },
   difficulty: {                  // surların canı izleyici sayısına göre ölçeklenir
     hpPerParticipant: 40,        // Bölüm 1'de etkileşime giren her kişi için sur bölümüne eklenecek can
@@ -98,8 +100,16 @@ const CONFIG = {
   siege: {                       // BÖLÜM 2 – Surlara saldırı
     wallSections: 5,             // sur bölümü sayısı (Topkapı ortadaki)
     wallHp: 1000,                // her sur bölümünün canı
-    regenDelaySeconds: 8,        // bu kadar saniye hasar gelmezse onarım başlar
-    regenPerSecond: 12,          // onarım hızı (can/sn, her bölüm için)
+    regenDelaySeconds: 8,        // bu kadar saniye hasar gelmezse hızlı onarım başlar
+    regenPerSecond: 12,          // hızlı onarım (can/sn, her bölüm için)
+    repair: {                    // Bizans onarım ustaları – rekabet için
+      passivePerSecond: 3,       // saldırı sürerken bile işleyen yavaş onarım (can/sn)
+      waveEverySeconds: 30,      // onarım dalgası aralığı (ekranda geri sayım)
+      waveHealRatio: 0.16,       // dalga, hedef bölüme canının bu oranı kadar onarım yapar
+      sectionsPerViewers: 12,    // her bu kadar aktif izleyici için dalga +1 bölüm onarır
+      maxSections: 3,            // dalganın aynı anda onarabileceği en fazla bölüm
+      activeWindowSeconds: 30    // "aktif izleyici": son bu kadar saniyede etkileşime giren
+    },
     collapseSeconds: 1.6,        // çökme animasyonu süresi
     flagMomentSeconds: 8         // Ulubatlı Hasan anının süresi
   },
@@ -239,25 +249,82 @@ const SFX = (function () {
     g.gain.exponentialRampToValueAtTime(peak, t0 + attack);
     g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
   }
-  function noise(t0, dur, f0, f1, peak, type, q) {
+  function noise(t0, dur, f0, f1, peak, type, q, out) {
     const src = ac.createBufferSource(); src.buffer = noiseBuf;
     const f = ac.createBiquadFilter(); f.type = type || 'lowpass'; f.Q.value = q || 0.8;
     f.frequency.setValueAtTime(f0, t0);
     if (f1) f.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
     const g = ac.createGain(); env(g, t0, 0.008, dur, peak);
-    src.connect(f); f.connect(g); g.connect(master);
+    src.connect(f); f.connect(g); g.connect(out || master);
     src.start(t0, Math.random() * 1.5); src.stop(t0 + dur + 0.05);
   }
-  function tone(t0, dur, f0, f1, peak, type, attack) {
+  function tone(t0, dur, f0, f1, peak, type, attack, out) {
     const o = ac.createOscillator(); o.type = type || 'sine';
     o.frequency.setValueAtTime(f0, t0);
     if (f1) o.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
     const g = ac.createGain(); env(g, t0, attack || 0.01, dur, peak);
-    o.connect(g); g.connect(master);
+    o.connect(g); g.connect(out || master);
     o.start(t0); o.stop(t0 + dur + 0.05);
   }
+  /* ---- Mehter marşı (özgün beste, Hicaz makamı). Notalar A4'e göre yarım ses; uzunluk sekizlik. ---- */
+  const MELODY = [
+    [0, 2], [1, 1], [4, 1], [5, 2], [4, 1], [1, 1],
+    [0, 2], [1, 1], [0, 1], [-2, 2], [0, 2],
+    [5, 2], [7, 1], [8, 1], [7, 2], [5, 1], [4, 1],
+    [5, 2], [4, 1], [1, 1], [0, 4],
+    [7, 2], [8, 1], [7, 1], [5, 2], [7, 2],
+    [8, 2], [7, 1], [5, 1], [4, 2], [5, 2],
+    [7, 1], [5, 1], [4, 1], [1, 1], [4, 2], [5, 1], [4, 1],
+    [1, 2], [4, 1], [1, 1], [0, 4]
+  ];
+  const NOTE_AT = [];               // sekizlik adım → [yarım ses, uzunluk] (nota başı)
+  { let k = 0; for (const [n, l] of MELODY) { NOTE_AT[k] = [n, l]; k += l; } }
+  const STEPS = 64, EIGHTH = 0.3;   // 8 ölçü, ♩ = 100
+  const DRUM = 'D.T.DDT.';          // düm-tek usulü (her ölçü)
+  let musicOn = false, musicGain = null, mStep = 0, mNext = 0;
+  function zurna(t0, semi, len) {
+    const f = 440 * Math.pow(2, semi / 12), dur = len * EIGHTH * 0.95;
+    const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = f;
+    const lfo = ac.createOscillator(); lfo.frequency.value = 5.5;
+    const lg = ac.createGain(); lg.gain.value = f * 0.006; lfo.connect(lg); lg.connect(o.frequency);
+    const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f * 2.2; bp.Q.value = 1.1;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.32, t0 + 0.03);
+    g.gain.setValueAtTime(0.32, t0 + dur - 0.06); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(bp); bp.connect(g); g.connect(musicGain);
+    o.start(t0); lfo.start(t0); o.stop(t0 + dur + 0.05); lfo.stop(t0 + dur + 0.05);
+    tone(t0, dur, f / 2, 0, 0.07, 'square', 0.03, musicGain);     // boru (alt oktav)
+  }
+  function musicStep(t, k) {
+    const n = NOTE_AT[k];
+    if (n) zurna(t, n[0], n[1]);
+    const d = DRUM[k % 8];
+    if (d === 'D') { tone(t, 0.45, 72, 42, 0.9, 'sine', 0.005, musicGain); noise(t, 0.12, 300, 90, 0.35, 'lowpass', 0.8, musicGain); }
+    else if (d === 'T') { noise(t, 0.09, 1400, 700, 0.32, 'bandpass', 1.2, musicGain); tone(t, 0.08, 220, 150, 0.2, 'triangle', 0.003, musicGain); }
+    if (k % 16 === 0) noise(t, 0.9, 7000, 4000, 0.09, 'highpass', 0.7, musicGain);          // zil
+    if (k % 32 >= 28) tone(t, 0.25, 58, 40, 0.5, 'sine', 0.005, musicGain);                 // kös gürlemesi
+  }
+  setInterval(() => {
+    if (!musicOn || muted || !ac || ac.state !== 'running') return;
+    if (!musicGain) { musicGain = ac.createGain(); musicGain.gain.value = A.musicVolume; musicGain.connect(master); }
+    if (mNext < ac.currentTime) mNext = ac.currentTime + 0.05;
+    while (mNext < ac.currentTime + 0.35) { musicStep(mNext, mStep); mStep = (mStep + 1) % STEPS; mNext += EIGHTH; }
+  }, 60);
+  function setMusic(on) {
+    on = !!on && A.music;
+    if (on === musicOn) return;
+    musicOn = on;
+    if (!ac) return;
+    if (!musicGain) { musicGain = ac.createGain(); musicGain.gain.value = A.musicVolume; musicGain.connect(master); }
+    if (on) { mStep = 0; mNext = 0; }
+  }
   return {
-    unlock,
+    unlock, setMusic,
+    hammer() {
+      if (!ready(true)) return;
+      const t = ac.currentTime;
+      for (let i = 0; i < 4; i++) { noise(t + i * 0.16, 0.07, 2600, 1800, 0.25, 'bandpass', 3); tone(t + i * 0.16, 0.06, 900, 700, 0.1, 'triangle', 0.002); }
+    },
     get muted() { return muted; },
     get state() { return !ac ? 'yok' : muted ? 'kapalı' : ac.state === 'running' ? 'açık' : 'tıklayın'; },
     toggle() { muted = !muted; if (!muted) unlock(); return muted; },
@@ -1243,7 +1310,7 @@ const G = {
   projectiles: [], floaters: [],
   notifs: [], notifQueue: [], notifTimer: 0,
   banner: null, shake: 0, flash: 0, fade: 0,
-  lastHitTime: 0, regenActive: false, smallIdx: 0, lastActivity: 0, allTop: [],
+  lastHitTime: 0, regenActive: false, smallIdx: 0, lastActivity: 0, allTop: [], recent: new Map(), repairAt: 0,
   tokens: CONFIG.spam.maxEffectsPerSecond
 };
 const queue = [];
@@ -1302,6 +1369,7 @@ function resetGame() {
 }
 function startPhase2() {
   G.phase = 'phase2'; G.phaseTime = 0; G.fade = 1; G.lastHitTime = G.now; G.hero = null;
+  G.repairAt = G.now + CONFIG.siege.repair.waveEverySeconds;
   clearProjectiles();
   initWalls();
   showWorld(2);
@@ -1310,6 +1378,31 @@ function startPhase2() {
   for (const s of G.soldiers) s.obj.position.y = groundY(s.obj.position.x, s.obj.position.z);
   showBanner('BÖLÜM 2', 'Surlara Saldırı – Mayıs 1453', 3.2);
   SFX.drums();
+}
+function activeViewers() {
+  const win = CONFIG.siege.repair.activeWindowSeconds;
+  let n = 0;
+  for (const [k, t] of G.recent) { if (G.now - t <= win) n++; else G.recent.delete(k); }
+  return n;
+}
+// Bizans onarım dalgası: en hasarlı sağlam bölüm(ler) bir anda onarılır
+function repairWave() {
+  const R = CONFIG.siege.repair;
+  G.repairAt = G.now + R.waveEverySeconds;
+  const count = Math.min(R.maxSections, 1 + Math.floor(activeViewers() / R.sectionsPerViewers));
+  const targets = SECTIONS.filter(s => !s.collapsed && s.hp < s.max * 0.98).sort((a, b) => a.hp / a.max - b.hp / b.max).slice(0, count);
+  if (!targets.length) return;
+  for (const s of targets) {
+    const heal = Math.round(Math.min(s.max - s.hp, s.max * R.waveHealRatio));
+    s.hp += heal;
+    floater(V3(s.cx, WALL.towerH + 2, WALL.towerZ + 3), '+' + fmt(heal), '#8ef0a0', 40);
+    for (let i = 0; i < 24; i++)
+      particle({ x: s.cx + rand(-4.5, 4.5), y: rand(1, 12), z: WALL.outerZ + rand(0.5, 2), vx: rand(-0.5, 0.5), vy: rand(1.5, 3.5), vz: rand(0, 1),
+        g: -1, drag: 1, life: rand(0.8, 1.4), size: 0.45, grow: 0, color: C_GOLD, alpha: 1, add: true });
+  }
+  const names = targets.map(s => s.gate ? 'Topkapı' : (s.i + 1) + '. bölüm').join(', ');
+  notify('Bizans ustaları surları onardı: ' + names + '!', '#8ef0a0', '🛠');
+  SFX.hammer();
 }
 function startFlagMoment() {
   refreshTop();
@@ -1400,6 +1493,7 @@ function giftTier(d) {
 function processEvent(e) {
   const P = G.phase;
   G.lastActivity = G.now;
+  G.recent.set(e.key, G.now);
   switch (e.type) {
     case 'chat': {
       if (P === 'final') break;
@@ -1762,7 +1856,9 @@ function update(dt) {
     if (G.phaseTime >= CONFIG.timing.transitionSeconds) startPhase2();
   } else if (P === 'phase2') {
     G.regenActive = G.now - G.lastHitTime > CONFIG.siege.regenDelaySeconds;
-    if (G.regenActive) for (const s of SECTIONS) if (!s.collapsed) s.hp = Math.min(s.max, s.hp + CONFIG.siege.regenPerSecond * (s.max / CONFIG.siege.wallHp) * dt);
+    const rate = (G.regenActive ? CONFIG.siege.regenPerSecond : 0) + CONFIG.siege.repair.passivePerSecond;
+    for (const s of SECTIONS) if (!s.collapsed) s.hp = Math.min(s.max, s.hp + rate * (s.max / CONFIG.siege.wallHp) * dt);
+    if (G.now >= G.repairAt) repairWave();
     if (SECTIONS.every(s => s.collapse >= 1)) startFlagMoment();
   } else if (P === 'flag') {
     updateHero();
@@ -1863,6 +1959,7 @@ function update(dt) {
   G.shake = Math.max(0, G.shake - dt * 40);
   G.flash = Math.max(0, G.flash - dt * 1.5);
   G.fade = Math.max(0, G.fade - dt);
+  SFX.setMusic(G.phase === 'phase1' || G.phase === 'trans1' || G.phase === 'phase2');
   updateCamera(dt);
   if (world1.visible) animateWater();
   animateFlags(G.now);
@@ -2013,7 +2110,12 @@ function drawTopUI() {
     let hp = 0, mx = 0, broken = 0;
     for (const s of SECTIONS) { hp += s.hp; mx += s.max; if (s.collapsed) broken++; }
     drawBar(40, 178, 1000, 54, mx ? hp / mx : 0, '#cdb88c', '#efe2c4', '🏰 İSTANBUL SURLARI', broken + '/' + SECTIONS.length + ' yıkıldı');
-    if (P === 'phase2' && G.regenActive && Math.sin(G.now * 6) > -0.3) txt('⚠️ Surlar onarılıyor! Saldırıya devam!', 540, 258, 26, '#ff9a7a', 'center', { lw: 5 });
+    if (P === 'phase2') {
+      const left = Math.max(0, Math.ceil(G.repairAt - G.now));
+      if (G.regenActive && Math.sin(G.now * 6) > -0.3) txt('⚠️ Saldırı durdu, surlar hızla onarılıyor!', 540, 258, 26, '#ff9a7a', 'center', { lw: 5 });
+      else if (!G.regenActive && left <= 5) { if (Math.sin(G.now * 10) > -0.2) txt('🛠 Bizans onarımı ' + left + ' sn! Onarımdan önce yık!', 540, 258, 28, '#ff7a6a', 'center', { lw: 6 }); }
+      else if (!G.regenActive) txt('🛠 Bizans onarımı: ' + left + ' sn', 540, 258, 26, '#bff0c8', 'center', { lw: 5 });
+    }
   } else {
     drawBar(40, 178, 1000, 54, 1, '#ffe27a', '#ffb02e', '🌅 FETİH TAMAMLANDI', '');
   }
@@ -2277,6 +2379,7 @@ if (new URLSearchParams(location.search).get('test') === '1' || location.hash ==
       SECTIONS.forEach((s, i) => setTimeout(() => collapseSection(s, p.nickname), 400 + i * 350));
     }],
     ['🔊 Ses aç/kapat', () => { SFX.toggle(); }],
+    ['🛠 Onarım dalgası', () => { if (G.phase === 'phase2') repairWave(); }],
     ['🔄 Oyunu sıfırla', () => resetGame(), 'warn'],
     ['🗑 Kalıcı sıralamayı sil', () => { if (confirm('Tüm zamanların sıralaması silinsin mi?')) STORE.clear(); }, 'warn']
   ];
@@ -2295,7 +2398,8 @@ if (new URLSearchParams(location.search).get('test') === '1' || location.hash ==
       'Gemi: ' + G.ships.length + '   Parçacık: ' + (PS.norm.list.length + PS.add.list.length) + '\n' +
       'Çizim: ' + info.calls + '   Üçgen: ' + Math.round(info.triangles / 1000) + 'k\n' +
       'WebSocket: ' + wsStatus + '   Ses: ' + SFX.state + '\n' +
-      'Sur canı: ' + (SECTIONS[0] ? fmt(SECTIONS[0].max) : '-') + '   Sefer: ' + STORE.sefer;
+      'Sur canı: ' + (SECTIONS[0] ? fmt(SECTIONS[0].max) : '-') + '   Sefer: ' + STORE.sefer + '\n' +
+      'Aktif izleyici: ' + activeViewers() + '   Onarım: ' + (G.phase === 'phase2' ? Math.max(0, Math.ceil(G.repairAt - G.now)) + ' sn' : '-');
   }, 500);
 })();
 
